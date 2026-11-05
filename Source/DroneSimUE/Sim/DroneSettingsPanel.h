@@ -9,6 +9,11 @@
 #include "Widgets/DeclarativeSyntaxSupport.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Sim/DroneWayback.h"
+#include "Sim/FpvBuild.h"
+#include "UObject/WeakObjectPtrTemplates.h"
+
+class ADronePreview;
+struct FSlateBrush;
 
 class SVerticalBox;
 
@@ -66,6 +71,26 @@ struct FDroneSimSettings
     double FpvKeyboardStick = 0.5;
     double FpvThrottleKeyRate = 0.6;
     double FpvCrashSpeedMps = 5.0;
+    // Drone builder: 1 = physical model from the parts (FpvBuild.h), 0 = simple model.
+    int32 FpvUseBuild = 1;
+    FString FpvDroneName = TEXT("5\" freestyle 4S"); // a ready-made drone (FpvBuild::kPresets) or one in Saved/Drones
+    int32 FpvFrame = 2;
+    int32 FpvMotor = 2;
+    int32 FpvProp = 2;
+    int32 FpvBattery = 1;
+    int32 FpvCameraSystem = 1;
+    double FpvPidMaster = 1.0;
+    double FpvPidDamping = 1.0;
+    // Throttle curve (Betaflight thr_mid / thr_expo / throttle limit) and the rates profile name.
+    double FpvThrottleMid = 0.5;
+    double FpvThrottleExpo = 0.0;
+    double FpvThrottleLimitPct = 100.0;
+    FString FpvRatesName = TEXT("Medium");
+    // Video camera as the localizer gets it (flight.mp4, frames.csv hfov_deg, the DroneLocalization export).
+    int32 CamWidthPx = 1280;
+    int32 CamHeightPx = 720;
+    int32 CamFps = 30;
+    double CamSurveyHFovDeg = 36.87;
 
     // --- Camera --------------------------------------------------------------
     bool bCameraGimbal = true; // false = camera fixed to the body (tilts with it)
@@ -99,6 +124,8 @@ struct FDroneSimSettings
 
     // --- Map loading (Cesium tilesets) -----------------------------------------------
     int32 MapQuality = 1;            // 0 normal, 1 high, 2 very high
+    // World: 0 terrain + draped imagery (2.5D), 1 Google Photorealistic 3D Tiles (buildings, trees).
+    int32 WorldMode = 0;
     bool bForbidHoles = true;        // keep a coarser tile until the finer ones are loaded
     bool bPreloadArea = true;        // load the map's area (+ margin) and keep it loaded
     double PreloadMarginM = 1000.0;
@@ -168,6 +195,7 @@ DECLARE_DELEGATE_TwoParams(FOnDroneMenuAction, EDroneMenuAction, const FDroneSim
 class SDroneSettingsPanel : public SCompoundWidget
 {
 public:
+    virtual ~SDroneSettingsPanel() override;
     SLATE_BEGIN_ARGS(SDroneSettingsPanel) : _InFlight(false) {}
     SLATE_ARGUMENT(FDroneSimSettings, Initial)
     // false: the main menu before a flight; true: the menu during a flight.
@@ -200,6 +228,8 @@ private:
         PageSettings = 3,
         PageHelp = 4,
         PageDates = 5,
+        PageBuilder = 6,
+        PageRates = 7,
     };
 
     // Building blocks
@@ -232,6 +262,37 @@ private:
     TSharedRef<SWidget> MapEditor();
     TSharedRef<SWidget> SettingsPage();
     TSharedRef<SWidget> ControlsTab();
+    TSharedRef<SWidget> BuildSection();
+    // Drone builder page (main / pause menu): ready-made drones, my drones (Saved/Drones/*.json), the parts.
+    TSharedRef<SWidget> BuilderPage();
+    void EnterBuilder();
+    void LeaveBuilder(bool bSave);
+    void RefreshDroneList();
+    void SelectPresetDrone(int32 Index);
+    void SelectUserDrone(const FString& Entry);
+    void SaveUserDrone();
+    void DeleteUserDrone();
+    TSharedPtr<SVerticalBox> DroneListBox;
+    FString DroneNote;
+    // 3D preview, stats and graphs of the drone being built.
+    TSharedRef<SWidget> CameraSection();
+    void RefreshBuildCache();
+    TWeakObjectPtr<ADronePreview> Preview;
+    TSharedPtr<FSlateBrush> PreviewBrush;
+    FpvBuild::Curves BuildCurves;
+    FpvBuild::Summary BuildSummary;
+    int64 BuildKey = -1;
+    // Rates and throttle page: ready-made profiles, my profiles (Saved/Rates/*.json), curves.
+    TSharedRef<SWidget> RatesPage();
+    void EnterRates();
+    void LeaveRates(bool bSave);
+    void RefreshRatesList();
+    void SelectPresetRates(int32 Index);
+    void SelectUserRates(const FString& Entry);
+    void SaveUserRates();
+    void DeleteUserRates();
+    TSharedPtr<SVerticalBox> RatesListBox;
+    FString RatesNote;
     TSharedRef<SWidget> VideoTab();
     TSharedRef<SWidget> SunTab();
     TSharedRef<SWidget> MarkersTab();

@@ -39,6 +39,7 @@ public:
 
     bool OpenMavlink(const FString& Host, int32 Port);
     bool OpenCsv(const FString& Path);
+    void CloseCsv(); // telemetry.csv only (MAVLink stays open)
     void Close();
 
     void WriteCsv(const FDroneTelemetrySample& Sample);

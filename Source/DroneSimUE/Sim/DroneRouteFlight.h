@@ -15,7 +15,9 @@
 #include "GameFramework/Pawn.h"
 #include "CesiumCamera.h"
 #include "Sim/DroneCompass.h"
+#include "Sim/DronePerfMonitor.h"
 #include "Sim/FpvModel.h"
+#include "Sim/FpvBuild.h"
 #include "Sim/DroneRtspServer.h"
 #include "Sim/DroneSettingsPanel.h"
 #include "Sim/DroneTelemetryOutput.h"
@@ -256,6 +258,52 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV", meta = (ClampMin = "0.005", Units = "Seconds"))
     double FpvRateTimeConstantS = 0.03;
 
+    // Drone builder (FpvBuild.h): 1 = fly the physical model built from the parts below
+    // (Betaflight-style rate PID, airmode mixer, KV/resistance motor model, battery sag);
+    // 0 = the simple model above (thrust/weight + lags).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build", meta = (ClampMin = "0", ClampMax = "1"))
+    int32 FpvUseBuild = 1;
+
+    // Indices into FpvBuild::kFrames / kMotors / kProps / kBatteries / kFpvSystems.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build")
+    int32 FpvFrame = 2;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build")
+    int32 FpvMotor = 2;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build")
+    int32 FpvProp = 2;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build")
+    int32 FpvBattery = 1;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build")
+    int32 FpvCameraSystem = 1;
+
+    // Betaflight configurator sliders: master multiplier (P, I, D, FF) and damping (D).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build", meta = (ClampMin = "0.2", ClampMax = "3"))
+    double FpvPidMaster = 1.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build", meta = (ClampMin = "0.2", ClampMax = "3"))
+    double FpvPidDamping = 1.0;
+
+    // Throttle curve, like Betaflight thr_mid / thr_expo / throttle limit (scale).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV", meta = (ClampMin = "0.05", ClampMax = "0.95"))
+    double FpvThrottleMid = 0.5;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV", meta = (ClampMin = "0", ClampMax = "1"))
+    double FpvThrottleExpo = 0.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV", meta = (ClampMin = "10", ClampMax = "100"))
+    double FpvThrottleLimitPct = 100.0;
+
+    // Names shown in the menu (the drone builder and the rates page).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV|Build")
+    FString FpvDroneName = TEXT("5\" freestyle 4S");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|FPV")
+    FString FpvRatesName = TEXT("Medium");
+
     // --- Camera --------------------------------------------------------------
     // Camera pitch relative to the body: -90 looks straight down, the image top points to the nose.
     // Up / Down arrows (gamepad D-pad) change it in flight; every flight starts with this value.
@@ -390,6 +438,16 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Debug")
     bool bShowDebugText = true;
 
+    // Performance monitor: every run writes Saved/Perf/<date-time>/ (frames.csv,
+    // system.csv with CPU / GPU / RAM / disk load, hitches.csv, summary.txt);
+    // Tools/perf_report.py turns it into a report. Costs well under 0.1 ms a frame.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Debug")
+    bool bPerfMonitor = true;
+
+    // A frame at least this long is logged as a hitch (as is a spike > 2.5x the recent average).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Debug", meta = (EditCondition = "bPerfMonitor", ClampMin = "5", Units = "Milliseconds"))
+    double PerfHitchMs = 50.0;
+
     // Compass tape at the top of the viewport during a flight (not in the video):
     // camera view direction, nose, ground track, next waypoint.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Debug")
@@ -400,6 +458,10 @@ public:
     // each step doubles the detail and roughly quadruples the tiles to load.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Map loading", meta = (ClampMin = "0", ClampMax = "2"))
     int32 MapQuality = 1;
+
+    // 0 terrain + draped imagery, 1 Google Photorealistic 3D Tiles (buildings, trees).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Map loading", meta = (ClampMin = "0", ClampMax = "1"))
+    int32 WorldMode = 0;
 
     // Keep showing a coarser tile until all its finer children are loaded, so no holes appear.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Map loading")
@@ -426,6 +488,14 @@ public:
     // (Not Cesium's "frustum culling off": that loads everything up to the fog distance, hundreds of km.)
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Map loading", meta = (ClampMin = "0", ClampMax = "3"))
     int32 AroundDroneDetail = 1;
+
+    // How AroundDroneDetail keeps the turned-away map. Off (default): Cesium keeps the tiles
+    // outside the view (EnforceCulledScreenSpaceError, culled SSE = view SSE x 1 / 2 / 4) in
+    // the one view's tile selection. On: the old invisible turned cameras; each one costs a
+    // full tile selection on the game thread every frame (2026-11-03 perf runs: ~30 extra
+    // views = ~265 ms game thread, none = ~26 ms).
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Drone|Map loading")
+    bool bAroundViaCameras = false;
 
     // 0 = step by step (Cesium's LoadingDescendantLimit 20: coarse, finer, final);
     // 1 = straight to the final detail (limit 1000: fewer tiles, but with ForbidHoles the coarse
@@ -505,6 +575,12 @@ private:
     void StopSession();
     void StartVideo();
     void StopVideo();
+    // Record mode, R key: starts a new clip (own folder: telemetry.csv,
+    // flight.mp4, frames.csv, ground_points.csv) or stops the current one.
+    // Manual / FPV flights start with recording off; a route / mission
+    // flight starts recording at once.
+    void StartRecordingClip();
+    void StopRecordingClip();
     void CaptureVideoFrame(const FDroneTelemetrySample& Sample, double Dt);
     // Record mode: casts rays from the video capture through a 3x3 pixel grid
     // (20/50/80 % of width and height) onto the Cesium terrain and logs the hits.
@@ -539,6 +615,9 @@ private:
     void UpdateMarkers(bool bForce);
     // Quality / cache / loading settings to every Cesium tileset.
     void ApplyTilesetSettings();
+    // WorldMode: shows the terrain tileset (2.5D) or Google Photorealistic 3D Tiles (spawned on first use).
+    void ApplyWorldMode();
+    TWeakObjectPtr<class ACesium3DTileset> Google3DTileset;
     // ImagerySource: the level's overlays or the stored Esri imagery (in the same material layer).
     void ApplyImagerySource();
     void EnsureHttpConnectionReuse();
@@ -551,6 +630,10 @@ private:
     void UpdatePreload(const FDroneSimSettings& Source, bool bForce);
     // Every Tick: the turned copies of the camera, then the camera manager's list.
     void UpdateAroundCameras();
+    // L in flight: Cesium loads no new tiles (MaximumSimultaneousTileLoads 0) and draws from
+    // what is loaded; L again resumes loading.
+    void SetMapLocked(bool bLocked);
+    bool bMapLocked = false;
     void PushCesiumCameras();
     // Load progress of the terrain tileset, 0..100 (-1 if there is none).
     float MapLoadProgress() const;
@@ -569,6 +652,8 @@ private:
     void LeaveFpv();
     void PickUpAfterCrash();
     FpvModel::Params FpvParams() const;
+    FpvBuild::Selection FpvSelection() const;
+    FpvBuild::Pids FpvPids() const;
 
     UPROPERTY(Transient)
     TObjectPtr<ACesiumGeoreference> Georeference;
@@ -594,6 +679,8 @@ private:
     FDroneRtspServer RtspServer;
     FDroneTileStore TileStore;
     FDroneWayback Wayback;
+    FDronePerfMonitor PerfMonitor;
+    double PerfSpeedMps = 0.0; // horizontal / FPV speed of the last tick, for the monitor
     FString StoredSourceName; // what the stored-imagery overlays show now
 
     // Overlays found on the tilesets at the first ApplyImagerySource (Bing), switched
@@ -623,6 +710,8 @@ private:
 
     // FPV mode
     FpvModel::State FpvState;
+    FpvBuild::PhysState FpvPhys;         // motors, battery, PID state of the built drone
+    FpvBuild::Physical FpvPhysical;      // derived from the parts in EnterFpv
     double FpvThrottle = 0.0;            // 0..1
     double FpvKeyStick[3];               // keyboard roll, pitch, yaw stick positions (set in EnterFpv)
     bool bFpvGamepadThrottle = false;    // the gamepad left stick sets the throttle once it was moved
@@ -672,6 +761,10 @@ private:
     double SinceTelemetryS = 0.0;
     double SinceHeartbeatS = 1.0;
     double SinceVideoFrameS = 0.0;
+    // SimTimeS when the current video started (video time starts at 0).
+    double VideoStartSimTimeS = 0.0;
+    // Record mode: false while waiting for R (no clip being written).
+    bool bRecordingClip = false;
     int64 FrameIndex = 0;
     int64 VideoFrameIndex = 0;
     bool bViewClaimed = false;

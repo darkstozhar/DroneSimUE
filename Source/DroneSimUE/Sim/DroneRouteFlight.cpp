@@ -36,6 +36,7 @@ constexpr double GravityMps2 = 9.80665;
 constexpr double TraceTopEllipsoidM = 9000.0;
 constexpr double TraceBottomEllipsoidM = -500.0;
 constexpr int64 CesiumWorldTerrainAssetId = 1;
+constexpr int64 GooglePhotorealistic3DTilesAssetId = 2275207;
 // The same service as FlightSimulator's contextily Esri.WorldImagery (DroneLocalization's maps).
 const TCHAR* const EsriWorldImageryUrl = TEXT("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}");
 const TCHAR* const EsriSourceId = TEXT("esri");
@@ -236,6 +237,10 @@ void ADroneRouteFlight::BeginPlay()
     }
     ApplyLiveSettings(Saved);
     ApplyStartPoint(Saved);
+    if (bPerfMonitor)
+    {
+        PerfMonitor.Start(GetWorld(), PerfHitchMs);
+    }
     ClaimView();
     if (bOpenSettingsAtStart)
     {
@@ -253,6 +258,7 @@ void ADroneRouteFlight::EndPlay(const EEndPlayReason::Type EndPlayReason)
     RemoveStatusLine();
     StopSession();
     TileStore.Stop();
+    PerfMonitor.Stop();
     Super::EndPlay(EndPlayReason);
 }
 
@@ -320,11 +326,19 @@ void ADroneRouteFlight::StartSession()
     {
         Telemetry.OpenMavlink(MavlinkHost, MavlinkPort);
     }
+    bRecordingClip = false;
+    if (VideoMode == EDroneVideoMode::Record && FlightMode != EDroneFlightMode::Route)
+    {
+        // Manual / FPV: nothing is written until R.
+        StatusNote = TEXT("Recording is off: press R to start / stop a clip.");
+        return;
+    }
     if (bWriteGroundTruthCsv)
     {
         Telemetry.OpenCsv(SessionDir / TEXT("telemetry.csv"));
     }
     StartVideo();
+    bRecordingClip = VideoMode == EDroneVideoMode::Record;
 }
 
 void ADroneRouteFlight::StopSession()
@@ -332,6 +346,39 @@ void ADroneRouteFlight::StopSession()
     StopVideo();
     Telemetry.Close();
     bSessionActive = false;
+    bRecordingClip = false;
+}
+
+void ADroneRouteFlight::StartRecordingClip()
+{
+    if (VideoMode != EDroneVideoMode::Record || !bSessionActive || bRecordingClip)
+    {
+        return;
+    }
+    // Each clip gets its own folder, so the exporter sees a normal flight.
+    SessionDir = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Flights") /
+                                                   FDateTime::Now().ToString(TEXT("%Y%m%d-%H%M%S")));
+    StatusNote.Reset();
+    if (bWriteGroundTruthCsv)
+    {
+        Telemetry.OpenCsv(SessionDir / TEXT("telemetry.csv"));
+    }
+    StartVideo();
+    bRecordingClip = true;
+    UE_LOG(LogDroneRoute, Display, TEXT("Recording started: %s"), *SessionDir);
+}
+
+void ADroneRouteFlight::StopRecordingClip()
+{
+    if (!bRecordingClip)
+    {
+        return;
+    }
+    StopVideo();
+    Telemetry.CloseCsv();
+    bRecordingClip = false;
+    StatusNote = FString::Printf(TEXT("Recording saved (%lld frames): %s   R: new clip"), VideoFrameIndex, *SessionDir);
+    UE_LOG(LogDroneRoute, Display, TEXT("Recording stopped: %s (%lld frames)"), *SessionDir, VideoFrameIndex);
 }
 
 // --- Video -------------------------------------------------------------------------
@@ -394,6 +441,7 @@ void ADroneRouteFlight::StartVideo()
     }
     VideoFrameIndex = 0;
     SinceVideoFrameS = 0.0;
+    VideoStartSimTimeS = SimTimeS;
 
     if (VideoMode == EDroneVideoMode::Record && bFixedFrameRateWhenRecording && GEngine != nullptr)
     {
@@ -458,7 +506,7 @@ void ADroneRouteFlight::CaptureVideoFrame(const FDroneTelemetrySample& Sample, d
     {
         // Fixed frame rate: the video time of frame N is exactly N / fps.
         const double VideoTimeS =
-            bFixedClock ? static_cast<double>(VideoFrameIndex) / FMath::Max(VideoFps, 1) : Sample.TimeS;
+            bFixedClock ? static_cast<double>(VideoFrameIndex) / FMath::Max(VideoFps, 1) : Sample.TimeS - VideoStartSimTimeS;
         Telemetry.WriteFrameRow(Sample, VideoFrameIndex, VideoTimeS);
         if (VideoMode == EDroneVideoMode::Record)
         {
@@ -574,7 +622,25 @@ FDroneSimSettings ADroneRouteFlight::CurrentSettings() const
     S.FpvKeyboardStick = FpvKeyboardStick;
     S.FpvThrottleKeyRate = FpvThrottleKeyRate;
     S.FpvCrashSpeedMps = FpvCrashSpeedMps;
+    S.FpvUseBuild = FpvUseBuild;
+    S.FpvFrame = FpvFrame;
+    S.FpvMotor = FpvMotor;
+    S.FpvProp = FpvProp;
+    S.FpvBattery = FpvBattery;
+    S.FpvCameraSystem = FpvCameraSystem;
+    S.FpvPidMaster = FpvPidMaster;
+    S.FpvPidDamping = FpvPidDamping;
+    S.FpvThrottleMid = FpvThrottleMid;
+    S.FpvThrottleExpo = FpvThrottleExpo;
+    S.FpvThrottleLimitPct = FpvThrottleLimitPct;
+    S.FpvDroneName = FpvDroneName;
+    S.FpvRatesName = FpvRatesName;
+    S.CamWidthPx = VideoWidth;
+    S.CamHeightPx = VideoHeight;
+    S.CamFps = VideoFps;
+    S.CamSurveyHFovDeg = CameraHorizontalFovDeg;
     S.MapQuality = MapQuality;
+    S.WorldMode = WorldMode;
     S.bForbidHoles = bForbidHoles;
     S.bPreloadArea = bPreloadArea;
     S.PreloadMarginM = PreloadMarginM;
@@ -637,7 +703,23 @@ void ADroneRouteFlight::ApplyLiveSettings(const FDroneSimSettings& S)
     FpvKeyboardStick = FMath::Clamp(S.FpvKeyboardStick, 0.05, 1.0);
     FpvThrottleKeyRate = FMath::Clamp(S.FpvThrottleKeyRate, 0.05, 5.0);
     FpvCrashSpeedMps = FMath::Max(S.FpvCrashSpeedMps, 0.5);
+    FpvUseBuild = FMath::Clamp(S.FpvUseBuild, 0, 1);
+    FpvFrame = FMath::Clamp(S.FpvFrame, 0, FpvBuild::CountOf(FpvBuild::kFrames) - 1);
+    FpvMotor = FMath::Clamp(S.FpvMotor, 0, FpvBuild::CountOf(FpvBuild::kMotors) - 1);
+    FpvProp = FMath::Clamp(S.FpvProp, 0, FpvBuild::CountOf(FpvBuild::kProps) - 1);
+    FpvBattery = FMath::Clamp(S.FpvBattery, 0, FpvBuild::CountOf(FpvBuild::kBatteries) - 1);
+    FpvCameraSystem = FMath::Clamp(S.FpvCameraSystem, 0, FpvBuild::CountOf(FpvBuild::kFpvSystems) - 1);
+    FpvPidMaster = FMath::Clamp(S.FpvPidMaster, 0.2, 3.0);
+    FpvPidDamping = FMath::Clamp(S.FpvPidDamping, 0.2, 3.0);
+    FpvPhysical = FpvBuild::Derive(FpvSelection()); // parts changed in the menu take effect at once
+    FpvThrottleMid = FMath::Clamp(S.FpvThrottleMid, 0.05, 0.95);
+    FpvThrottleExpo = FMath::Clamp(S.FpvThrottleExpo, 0.0, 1.0);
+    FpvThrottleLimitPct = FMath::Clamp(S.FpvThrottleLimitPct, 10.0, 100.0);
+    FpvDroneName = S.FpvDroneName;
+    FpvRatesName = S.FpvRatesName;
     MapQuality = FMath::Clamp(S.MapQuality, 0, 2);
+    WorldMode = FMath::Clamp(S.WorldMode, 0, 1);
+    ApplyWorldMode();
     bForbidHoles = S.bForbidHoles;
     bPreloadArea = S.bPreloadArea;
     PreloadMarginM = FMath::Clamp(S.PreloadMarginM, 0.0, 20000.0);
@@ -683,6 +765,13 @@ void ADroneRouteFlight::ApplyLiveSettings(const FDroneSimSettings& S)
         RtspServerPath = S.RtspServerPath;
         MavlinkHost = S.MavlinkHost;
         MavlinkPort = FMath::Clamp(S.MavlinkPort, 1, 65535);
+        // The video camera (the drone builder's camera section): what the localizer gets.
+        VideoWidth = FMath::Clamp(S.CamWidthPx, 64, 3840);
+        VideoHeight = FMath::Clamp(S.CamHeightPx, 64, 2160);
+        VideoFps = FMath::Clamp(S.CamFps, 1, 120);
+        CameraHorizontalFovDeg = static_cast<float>(FMath::Clamp(S.CamSurveyHFovDeg, 5.0, 170.0));
+        CameraAspectRatio = static_cast<float>(VideoWidth) / static_cast<float>(VideoHeight);
+        ApplyCameraSettings();
     }
     UpdateMarkers(/*bForce*/ true);
 }
@@ -1118,11 +1207,22 @@ FString ADroneRouteFlight::StatusText() const
         Status = FString::Printf(TEXT("%s  lat %.6f  lon %.6f  AGL %.1f m  heading %.1f"), ModeName,
                                Latitude, Longitude, bHaveGround ? EllipsoidHeightM - GroundEllipsoidHeightM : -1.0,
                                HeadingDeg);
+        if (bMapLocked)
+        {
+            Status += TEXT("  MAP LOCKED (L)");
+        }
         if (bFpv)
         {
             Status += FString::Printf(TEXT("  throttle %.0f%%%s  speed %.1f m/s  pitch %.0f  roll %.0f%s"), FpvThrottle * 100.0,
                                     bFpvGamepadThrottle ? TEXT(" (gamepad)") : TEXT(""), FpvModel::Length(FpvState.Vel),
                                     PitchDeg, RollDeg, bFpvCrashed ? TEXT("  CRASHED") : TEXT(""));
+            if (FpvUseBuild != 0)
+            {
+                const double CellV = FpvPhys.PackVolts / FMath::Max(FpvPhysical.Cells, 1);
+                Status += FString::Printf(TEXT("  battery %.1f V (%.2f V/cell) %.0f A  %.0f mAh used%s"), FpvPhys.PackVolts,
+                                        CellV, FpvPhys.PackCurrentA, FpvPhys.UsedAh * 1000.0,
+                                        CellV < 3.3 ? TEXT("  LOW BATTERY") : TEXT(""));
+            }
         }
         else if (!bCameraGimbal)
         {
@@ -1147,7 +1247,8 @@ FString ADroneRouteFlight::StatusText() const
         }
         if (VideoMode == EDroneVideoMode::Record)
         {
-            Status += Video.IsRunning() ? FString::Printf(TEXT("  REC %lld"), VideoFrameIndex) : FString(TEXT("  REC failed"));
+            Status += Video.IsRunning() ? FString::Printf(TEXT("  REC %lld  (R: stop)"), VideoFrameIndex)
+                                        : (bRecordingClip ? FString(TEXT("  REC failed")) : FString(TEXT("  REC off (R: start)")));
         }
         else if (VideoMode == EDroneVideoMode::Live)
         {
@@ -1164,8 +1265,8 @@ FString ADroneRouteFlight::StatusText() const
         {
             Status += TEXT("  imagery: Esri, Maxar, Earthstar Geographics");
         }
-        Status += bFpv ? TEXT("   [Esc / F2 / Tab: menu,  F: leave FPV,  Space / Ctrl: throttle,  W/S A/D: pitch / roll,  Left / Right: yaw,  R: pick up after a crash]")
-                       : TEXT("   [Esc / F2 / Tab: menu,  M: manual <-> route / mission,  F: FPV,  Left / Right: turn,  Up / Down, Q / E: camera (C: reset),  V: add area vertex]");
+        Status += bFpv ? TEXT("   [Esc / F2 / Tab: menu,  L: lock map,  F: leave FPV,  Space / Ctrl: throttle,  W/S A/D: pitch / roll,  Left / Right: yaw,  R: pick up after a crash]")
+                       : TEXT("   [Esc / F2 / Tab: menu,  L: lock map,  M: manual <-> route / mission,  F: FPV,  Left / Right: turn,  Up / Down, Q / E: camera (C: reset),  V: add area vertex,  R: record on / off]");
     }
     if (!StatusNote.IsEmpty())
     {
@@ -1436,6 +1537,60 @@ void ADroneRouteFlight::RequestWaybackVersions(const FDroneSimSettings& Source)
     Wayback.RequestVersions(CentreLat, CentreLon, ResolvedTileStoreDir());
 }
 
+void ADroneRouteFlight::ApplyWorldMode()
+{
+    UWorld* World = GetWorld();
+    if (World == nullptr)
+    {
+        return;
+    }
+    const bool b3D = WorldMode == 1;
+    if (b3D && !Google3DTileset.IsValid())
+    {
+        for (TActorIterator<ACesium3DTileset> It(World); It; ++It)
+        {
+            if (It->GetIonAssetID() == GooglePhotorealistic3DTilesAssetId)
+            {
+                Google3DTileset = *It;
+                break;
+            }
+        }
+        if (!Google3DTileset.IsValid())
+        {
+            FActorSpawnParameters Params;
+            Params.Name = MakeUniqueObjectName(World->PersistentLevel, ACesium3DTileset::StaticClass(), TEXT("Google3DTiles"));
+            Params.ObjectFlags |= RF_Transient;
+            ACesium3DTileset* Tileset = World->SpawnActor<ACesium3DTileset>(Params);
+            if (Tileset != nullptr)
+            {
+                Tileset->SetTilesetSource(ETilesetSource::FromCesiumIon);
+                Tileset->SetIonAssetID(GooglePhotorealistic3DTilesAssetId);
+#if WITH_EDITOR
+                Tileset->SetActorLabel(TEXT("Google Photorealistic 3D Tiles"), false);
+#endif
+                Google3DTileset = Tileset;
+                UE_LOG(LogDroneRoute, Display, TEXT("World: spawned Google Photorealistic 3D Tiles (ion asset %lld)"),
+                       GooglePhotorealistic3DTilesAssetId);
+            }
+            else
+            {
+                UE_LOG(LogDroneRoute, Warning, TEXT("World: could not spawn the Google 3D Tiles tileset"));
+            }
+        }
+    }
+    // Hidden actors keep their collision, so terrain traces (telemetry heights) keep working.
+    for (TActorIterator<ACesium3DTileset> It(World); It; ++It)
+    {
+        const bool bIsGoogle = It->GetIonAssetID() == GooglePhotorealistic3DTilesAssetId;
+        const bool bShow = bIsGoogle ? b3D : !b3D;
+        It->SetActorHiddenInGame(!bShow);
+#if WITH_EDITOR
+        It->SetIsTemporarilyHiddenInEditor(!bShow);
+#endif
+    }
+    UE_LOG(LogDroneRoute, Display, TEXT("World: %s"), b3D ? TEXT("3D (Google Photorealistic 3D Tiles)") : TEXT("terrain + imagery"));
+}
+
 void ADroneRouteFlight::ApplyTilesetSettings()
 {
     UWorld* World = GetWorld();
@@ -1452,14 +1607,18 @@ void ADroneRouteFlight::ApplyTilesetSettings()
         // Cesium copies these into the tileset options every Tick.
         It->SetMaximumScreenSpaceError(Sse);
         It->ForbidHoles = bForbidHoles;
-        It->MaximumSimultaneousTileLoads = MaxSimultaneousTileLoads;
+        It->MaximumSimultaneousTileLoads = bMapLocked ? 0 : MaxSimultaneousTileLoads;
         It->MaximumCachedBytes = static_cast<int64>(TileMemoryCacheMB) * 1024 * 1024;
-        // Cesium's defaults. With frustum culling off every tile up to the fog distance
+        // Frustum culling stays on: with it off every tile up to the fog distance
         // (hundreds of km) gets refined; the 2026-10-21 test with that (and descendant
         // limit 1000) stayed at the coarsest tiles for 10 minutes. What turning would
-        // show is loaded by UpdateAroundCameras instead.
+        // show is kept instead by refining the culled tiles to a coarser error (they are
+        // loaded, not drawn), in the same tile selection as the view: no extra cameras.
         It->EnableFrustumCulling = true;
-        It->EnforceCulledScreenSpaceError = false;
+        const int32 Around = FMath::Clamp(AroundDroneDetail, 0, 3);
+        static const double CulledSseFactors[] = {1.0, 1.0, 2.0, 4.0};
+        It->EnforceCulledScreenSpaceError = !bAroundViaCameras && Around > 0;
+        It->CulledScreenSpaceError = Sse * CulledSseFactors[Around];
         It->LoadingDescendantLimit = DescendantLimit;
     }
     static const TCHAR* TurnedViewNames[] = {TEXT("off"), TEXT("same detail"), TEXT("half detail"), TEXT("quarter detail")};
@@ -1495,7 +1654,11 @@ float ADroneRouteFlight::MapLoadProgress() const
     int32 Count = 0;
     for (TActorIterator<ACesium3DTileset> It(World); It; ++It)
     {
-        if (It->GetIonAssetID() == CesiumWorldTerrainAssetId)
+        if (It->IsHidden())
+        {
+            continue;
+        }
+        if (It->GetIonAssetID() == (WorldMode == 1 ? GooglePhotorealistic3DTilesAssetId : CesiumWorldTerrainAssetId))
         {
             return It->GetLoadProgress();
         }
@@ -1611,7 +1774,7 @@ void ADroneRouteFlight::UpdateAroundCameras()
     AroundCameras.Reset();
     const int32 Around = FMath::Clamp(AroundDroneDetail, 0, 3);
     UWorld* World = GetWorld();
-    if (Around == 0 || Camera == nullptr || World == nullptr)
+    if (!bAroundViaCameras || Around == 0 || Camera == nullptr || World == nullptr)
     {
         return;
     }
@@ -1634,6 +1797,22 @@ void ADroneRouteFlight::UpdateAroundCameras()
         const FQuat Turn(FVector::UpVector, FMath::DegreesToRadians(360.0 * Index / Count));
         AroundCameras.Add(FCesiumCamera(FVector2D(WidthPx, HeightPx), Location, (Turn * View).Rotator(), FovDeg));
     }
+}
+
+void ADroneRouteFlight::SetMapLocked(bool bLocked)
+{
+    bMapLocked = bLocked;
+    if (UWorld* World = GetWorld())
+    {
+        // Not SuspendUpdate: that also freezes what is drawn (only the view at the moment
+        // of locking). Here Cesium still picks what to draw from the loaded tiles every
+        // frame, but loads nothing new; the cache keeps the loaded ones.
+        for (TActorIterator<ACesium3DTileset> It(World); It; ++It)
+        {
+            It->MaximumSimultaneousTileLoads = bLocked ? 0 : MaxSimultaneousTileLoads;
+        }
+    }
+    UE_LOG(LogDroneRoute, Display, TEXT("Map %s"), bLocked ? TEXT("locked: no new tile loads") : TEXT("unlocked"));
 }
 
 void ADroneRouteFlight::PushCesiumCameras()
@@ -1758,17 +1937,50 @@ FpvModel::Params ADroneRouteFlight::FpvParams() const
     return P;
 }
 
+FpvBuild::Selection ADroneRouteFlight::FpvSelection() const
+{
+    FpvBuild::Selection Sel;
+    Sel.FrameIndex = FpvFrame;
+    Sel.MotorIndex = FpvMotor;
+    Sel.PropIndex = FpvProp;
+    Sel.BatteryIndex = FpvBattery;
+    Sel.FpvIndex = FpvCameraSystem;
+    return Sel;
+}
+
+FpvBuild::Pids ADroneRouteFlight::FpvPids() const
+{
+    FpvBuild::Pids Pid;
+    Pid.Master = FpvPidMaster;
+    Pid.DGain = FpvPidDamping;
+    return Pid;
+}
+
 void ADroneRouteFlight::EnterFpv(bool bOnGround)
 {
     FpvState = FpvModel::State();
     FpvState.Att = FpvModel::FromYawPitchRoll(FMath::DegreesToRadians(HeadingDeg), 0.0, 0.0);
+    // A fresh, fully charged pack every time FPV starts.
+    FpvPhysical = FpvBuild::Derive(FpvSelection());
+    FpvPhys = FpvBuild::PhysState();
+    FpvBuild::ResetForPark(FpvPhys, FpvPhysical);
+    double BuildHover = 0.0;
     if (!bOnGround)
     {
         // In the air: level, with the current speed and the throttle at hover.
         FpvState.Vel = FpvModel::MakeVec(ManualVelNorth, ManualVelEast, 0.0);
         FpvState.ThrustAccel = FpvModel::kGravity;
+        BuildHover = FpvBuild::PrimeHover(FpvPhys, FpvPhysical, FpvState);
     }
-    FpvThrottle = bOnGround ? 0.0 : FpvModel::HoverThrottle(FpvParams());
+    if (FpvUseBuild != 0)
+    {
+        const FpvBuild::Summary Sm = FpvBuild::Summarize(FpvSelection(), FpvPhysical);
+        UE_LOG(LogDroneRoute, Display, TEXT("FPV build: %.0f g, thrust/weight %.1f, hover %.0f%%, %s"), Sm.MassG,
+               Sm.ThrustToWeight, Sm.HoverThrottle * 100.0, UTF8_TO_TCHAR(Sm.Warnings.c_str()));
+    }
+    // The stick position that gives hover through the throttle curve.
+    const double HoverOut = FpvUseBuild != 0 ? BuildHover : FpvModel::HoverThrottle(FpvParams());
+    FpvThrottle = bOnGround ? 0.0 : FpvBuild::ThrottleStickFor(HoverOut, FpvThrottleMid, FpvThrottleExpo, FpvThrottleLimitPct);
     FpvKeyStick[0] = FpvKeyStick[1] = FpvKeyStick[2] = 0.0;
     bFpvGamepadThrottle = false;
     bFpvCrashed = false;
@@ -1813,6 +2025,7 @@ void ADroneRouteFlight::PickUpAfterCrash()
     FpvModel::ToYawPitchRoll(FpvState.Att, YawRad, PitchRad, RollRad);
     FpvState = FpvModel::State();
     FpvState.Att = FpvModel::FromYawPitchRoll(YawRad, 0.0, 0.0);
+    FpvBuild::ResetForPark(FpvPhys, FpvPhysical); // same pack, motors stopped
     FpvThrottle = 0.0;
     bFpvCrashed = false;
     bFpvPlaceOnGround = true;
@@ -1870,9 +2083,11 @@ void ADroneRouteFlight::AdvanceFpv(double Dt, double& OutVelNorth, double& OutVe
             FpvThrottle = FMath::Clamp(FpvThrottle + ThrottleMove * FpvThrottleKeyRate * Dt, 0.0, 1.0);
         }
     }
-    In.Throttle = FpvThrottle;
+    In.Throttle = FpvBuild::ThrottleCurve(FpvThrottle, FpvThrottleMid, FpvThrottleExpo, FpvThrottleLimitPct);
 
-    const FpvModel::Vec3 Moved = FpvModel::Step(FpvState, In, FpvParams(), Dt);
+    const FpvModel::Vec3 Moved = FpvUseBuild != 0
+                                     ? FpvBuild::Step(FpvState, FpvPhys, In, FpvParams(), FpvPhysical, FpvPids(), Dt)
+                                     : FpvModel::Step(FpvState, In, FpvParams(), Dt);
     Latitude += FMath::RadiansToDegrees(Moved.X / EarthRadiusM);
     Longitude += FMath::RadiansToDegrees(Moved.Y / (EarthRadiusM * FMath::Cos(FMath::DegreesToRadians(Latitude))));
     EllipsoidHeightM -= Moved.Z;
@@ -1890,6 +2105,7 @@ void ADroneRouteFlight::AdvanceFpv(double Dt, double& OutVelNorth, double& OutVe
             FpvState.Vel = FpvModel::Vec3();
             FpvState.Rate = FpvModel::Vec3();
             FpvState.ThrustAccel = 0.0;
+            FpvBuild::ResetForPark(FpvPhys, FpvPhysical);
             StatusNote = FString::Printf(TEXT("CRASHED at %.1f m/s (%.0f km/h). R: pick the drone up."), ImpactSpeedMps,
                                          ImpactSpeedMps * 3.6);
             UE_LOG(LogDroneRoute, Display, TEXT("FPV crash at %.1f m/s, tilt %.0f deg"), ImpactSpeedMps,
@@ -1912,6 +2128,10 @@ void ADroneRouteFlight::AdvanceFpv(double Dt, double& OutVelNorth, double& OutVe
                 FpvModel::ToYawPitchRoll(FpvState.Att, SitYawRad, SitPitchRad, SitRollRad);
                 FpvState.Att = FpvModel::FromYawPitchRoll(SitYawRad, 0.0, 0.0);
                 FpvState.Rate = FpvModel::Vec3();
+                for (double& I : FpvPhys.ITerm)
+                {
+                    I = 0.0; // Betaflight resets the I term on the ground too
+                }
             }
         }
     }
@@ -2082,6 +2302,10 @@ void ADroneRouteFlight::HandleHotkeys()
     {
         return;
     }
+    if (PC->WasInputKeyJustPressed(EKeys::L))
+    {
+        SetMapLocked(!bMapLocked);
+    }
     if (PC->WasInputKeyJustPressed(EKeys::F))
     {
         if (FlightMode == EDroneFlightMode::Fpv)
@@ -2106,9 +2330,23 @@ void ADroneRouteFlight::HandleHotkeys()
             SwitchToRoute();
         }
     }
-    if (FlightMode == EDroneFlightMode::Fpv && bFpvCrashed && PC->WasInputKeyJustPressed(EKeys::R))
+    if (PC->WasInputKeyJustPressed(EKeys::R))
     {
-        PickUpAfterCrash();
+        if (FlightMode == EDroneFlightMode::Fpv && bFpvCrashed)
+        {
+            PickUpAfterCrash(); // after a crash R picks the drone up first
+        }
+        else if (VideoMode == EDroneVideoMode::Record)
+        {
+            if (bRecordingClip)
+            {
+                StopRecordingClip();
+            }
+            else
+            {
+                StartRecordingClip();
+            }
+        }
     }
     if (PC->WasInputKeyJustPressed(EKeys::V))
     {
@@ -2364,34 +2602,68 @@ void ADroneRouteFlight::Tick(float DeltaSeconds)
     Super::Tick(DeltaSeconds);
     const double Dt = static_cast<double>(DeltaSeconds);
 
-    if (bPendingAction)
+    if (PerfMonitor.IsRunning())
     {
-        bPendingAction = false;
-        HandleMenuAction(PendingAction, PendingSettings);
+        FDronePerfFrameContext Ctx;
+        Ctx.Mode = !bFlying ? TEXT("HOVER") : (FlightMode == EDroneFlightMode::Fpv ? TEXT("FPV")
+                                             : (FlightMode == EDroneFlightMode::Manual ? TEXT("MANUAL") : TEXT("ROUTE")));
+        Ctx.bMenuOpen = SettingsPanel.IsValid();
+        Ctx.bCrashed = bFpvCrashed;
+        Ctx.SpeedMps = PerfSpeedMps;
+        Ctx.AglM = bHaveGround ? EllipsoidHeightM - GroundEllipsoidHeightM : -1.0;
+        Ctx.HeadingDeg = HeadingDeg;
+        Ctx.PitchDeg = PitchDeg;
+        Ctx.RollDeg = RollDeg;
+        Ctx.VideoMode = bSessionActive ? static_cast<int32>(VideoMode) : 0;
+        Ctx.CesiumCameras = BaseAdditionalCameras.Num() + PreloadCameras.Num() + AroundCameras.Num();
+        PerfMonitor.BeginFrame(GetWorld(), DeltaSeconds, Ctx);
     }
-    if (bPendingCloseMenu)
+
     {
-        bPendingCloseMenu = false;
-        CloseMenu();
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::Input);
+        if (bPendingAction)
+        {
+            bPendingAction = false;
+            HandleMenuAction(PendingAction, PendingSettings);
+        }
+        if (bPendingCloseMenu)
+        {
+            bPendingCloseMenu = false;
+            CloseMenu();
+        }
+        HandleHotkeys();
     }
-    HandleHotkeys();
     if (Georeference == nullptr || Dt <= 0.0)
     {
         return;
     }
-    ClaimView();
-    UpdateCameraAim(Dt);
-    UpdateAroundCameras();
-    PushCesiumCameras();
+    {
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::View);
+        ClaimView();
+        UpdateCameraAim(Dt);
+    }
+    {
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::AroundCameras);
+        UpdateAroundCameras();
+    }
+    {
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::CesiumCameras);
+        PushCesiumCameras();
+    }
     SinceMarkersCheckS += Dt;
     if (SinceMarkersCheckS >= 0.5)
     {
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::Markers);
         SinceMarkersCheckS = 0.0;
         UpdateMarkers(/*bForce*/ false);
     }
 
     double Ground = 0.0;
-    const bool bGroundHit = TraceGroundEllipsoidHeight(Longitude, Latitude, Ground);
+    bool bGroundHit = false;
+    {
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::GroundTrace);
+        bGroundHit = TraceGroundEllipsoidHeight(Longitude, Latitude, Ground);
+    }
     if (bGroundHit)
     {
         GroundEllipsoidHeightM = Ground;
@@ -2431,6 +2703,8 @@ void ADroneRouteFlight::Tick(float DeltaSeconds)
 
     const double PreviousHeight = EllipsoidHeightM;
     double VelNorth = 0.0, VelEast = 0.0;
+    TOptional<FDronePerfMonitor::FScope> PhysicsScope;
+    PhysicsScope.Emplace(PerfMonitor, EDronePerfScope::Physics);
     if (bHaveStartGround && bFlying && FlightMode == EDroneFlightMode::Fpv)
     {
         // Physics sets the height and the attitude: no altitude hold, no gimbal.
@@ -2453,7 +2727,11 @@ void ADroneRouteFlight::Tick(float DeltaSeconds)
         EllipsoidHeightM += (Target - EllipsoidHeightM) * Alpha;
         UpdateTilt(Dt, VelNorth, VelEast);
     }
+    PhysicsScope.Reset();
+    PerfSpeedMps = FlightMode == EDroneFlightMode::Fpv ? FpvModel::Length(FpvState.Vel) : FMath::Sqrt(VelNorth * VelNorth + VelEast * VelEast);
 
+    TOptional<FDronePerfMonitor::FScope> MoveScope;
+    MoveScope.Emplace(PerfMonitor, EDronePerfScope::Move);
     GlobeAnchor->MoveToLongitudeLatitudeHeight(FVector(Longitude, Latitude, EllipsoidHeightM));
     GlobeAnchor->SetEastSouthUpRotation(FRotator(0.0, HeadingDeg - 90.0, 0.0).Quaternion());
     if (Camera != nullptr)
@@ -2467,8 +2745,11 @@ void ADroneRouteFlight::Tick(float DeltaSeconds)
         Camera->SetRelativeRotation(Body * Mount);
     }
 
+    MoveScope.Reset();
+
     if (bHaveStartGround && bSessionActive)
     {
+        FDronePerfMonitor::FScope PerfScope(PerfMonitor, EDronePerfScope::Telemetry);
         // Samples are stamped 0, Dt, 2 Dt, ... so sample N lines up with
         // video frame N (time N / fps when recording).
         EmitTelemetry(Dt, VelNorth, VelEast, -(EllipsoidHeightM - PreviousHeight) / Dt);

@@ -178,10 +178,8 @@ void FDroneTelemetryOutput::CloseGroundCsv()
     GroundRowsSinceFlush = 0;
 }
 
-void FDroneTelemetryOutput::Close()
+void FDroneTelemetryOutput::CloseCsv()
 {
-    CloseFramesCsv();
-    CloseGroundCsv();
     if (Csv != nullptr)
     {
         Csv->Flush();
@@ -189,6 +187,13 @@ void FDroneTelemetryOutput::Close()
         delete Csv;
         Csv = nullptr;
     }
+}
+
+void FDroneTelemetryOutput::Close()
+{
+    CloseFramesCsv();
+    CloseGroundCsv();
+    CloseCsv();
     if (Socket != nullptr)
     {
         Socket->Close();

@@ -25,6 +25,12 @@ public class DroneSimUE : ModuleRules
 		// Imagery kept on disk: loopback tile server (HTTPServer) and the downloads (HTTP).
 		PrivateDependencyModuleNames.AddRange(new string[] { "HTTP", "HTTPServer" });
 
+		// Performance monitor: Windows performance counters (CPU / GPU / RAM / disk).
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			PublicSystemLibraries.Add("pdh.lib");
+		}
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 
